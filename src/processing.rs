@@ -36,7 +36,7 @@ pub fn process_journalctl(config: Config) -> Result<()> {
     }
 
     let mut process_args = Vec::new();
-    let slice = &["-o", "json", "-f"];
+    let slice = &["-o", "json", "-f", "--merge"];
     process_args.extend_from_slice(slice);
 
     if config.journal_dir.len() > 0 {
