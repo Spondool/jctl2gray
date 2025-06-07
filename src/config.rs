@@ -11,6 +11,7 @@ pub enum LogSource {
 #[derive(Debug)]
 pub struct Config {
     pub log_source: LogSource,
+    pub journal_dir: String,
     pub sender_port: u16,
     pub graylog_addr: String,
     pub graylog_addr_ttl: u64,

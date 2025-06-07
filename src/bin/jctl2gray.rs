@@ -29,6 +29,16 @@ fn parse_options() -> Config {
                 .required(true),
         )
         .arg(
+            Arg::with_name("journal_dir")
+                .short("d")
+                .long("journal_dir")
+                .value_name("journal dir")
+                .help("Directory to read journal files from (useful for remote)")
+                .takes_value(true)
+                .required(false)
+                .default_value(""),
+        )
+        .arg(
             Arg::with_name("port")
                 .short("p")
                 .long("port")
@@ -107,6 +117,7 @@ fn parse_options() -> Config {
         .get_matches();
 
     let log_source = parse_log_source(args.value_of("log_source").unwrap()).unwrap();
+    let journal_dir = args.value_of("journal_dir").unwrap().to_string();
     let sender_port: u16 = args.value_of("port").unwrap().parse().unwrap();
     let graylog_addr = args.value_of("target").unwrap().to_string();
     let graylog_addr_ttl: u64 = args.value_of("ttl").unwrap().parse().unwrap();
@@ -122,6 +133,7 @@ fn parse_options() -> Config {
 
     Config {
         log_source,
+        journal_dir,
         sender_port,
         graylog_addr,
         graylog_addr_ttl,

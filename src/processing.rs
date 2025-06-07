@@ -35,8 +35,17 @@ pub fn process_journalctl(config: Config) -> Result<()> {
         ));
     }
 
+    let mut process_args = Vec::new();
+    let slice = &["-o", "json", "-f"];
+    process_args.extend_from_slice(slice);
+
+    if config.journal_dir.len() > 0 {
+        process_args.push("--file");
+        process_args.push(&config.journal_dir);
+    }
+
     let mut subprocess = process::Command::new("journalctl")
-        .args(&["-o", "json", "-f"])
+        .args(&process_args)
         .stdout(process::Stdio::piped())
         .stderr(process::Stdio::piped())
         .spawn()?;
