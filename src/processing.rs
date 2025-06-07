@@ -40,7 +40,7 @@ pub fn process_journalctl(config: Config) -> Result<()> {
     process_args.extend_from_slice(slice);
 
     if config.journal_dir.len() > 0 {
-        process_args.push("--file");
+        process_args.push("--directory");
         process_args.push(&config.journal_dir);
     }
 
