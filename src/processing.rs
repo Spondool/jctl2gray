@@ -109,8 +109,12 @@ pub fn process_journalctl(config: Config) -> Result<()> {
             debug!("Poll #{}: No new messages", poll_count);
         }
         
-        // Sleep for 1 second before next poll
-        thread::sleep(Duration::from_secs(1));
+        // Sleep for configurable interval before next poll (default 1 second)
+        let poll_interval = std::env::var("JCTL2GRAY_POLL_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(1);
+        thread::sleep(Duration::from_secs(poll_interval));
     }
 }
 
