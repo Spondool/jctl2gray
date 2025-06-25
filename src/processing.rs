@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fs;
 use std::io::{self, BufRead, BufReader};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process;
@@ -38,12 +39,27 @@ pub fn process_journalctl(config: Config) -> Result<()> {
     }
 
     let mut process_args = Vec::new();
-    let slice = &["-o", "json", "-f", "--merge", "--no-tail"];
+    let slice = &["-o", "json", "-f", "--merge"];
     process_args.extend_from_slice(slice);
 
     if config.journal_dir.len() > 0 {
         process_args.push("--directory");
         process_args.push(&config.journal_dir);
+    }
+
+    // Load cursor from file to resume from last position
+    let cursor_file = get_cursor_file_path(&config);
+    let cursor_option = load_cursor(&cursor_file);
+    
+    if let Some(ref cursor) = cursor_option {
+        info!("Resuming from cursor: {}", cursor);
+        process_args.push("--after-cursor");
+        process_args.push(cursor);
+    } else {
+        info!("No cursor found, starting from current position");
+        // Start from now to avoid historical messages
+        process_args.push("--since");
+        process_args.push("now");
     }
 
     let mut subprocess = process::Command::new("journalctl")
@@ -157,6 +173,13 @@ pub fn process_journalctl(config: Config) -> Result<()> {
 
                         // use outdated address
                         Err(e) => warn!("cannot resolve graylog address: {}", e),
+                    }
+                }
+
+                // Extract and save cursor before processing
+                if let Some(cursor) = extract_cursor_from_json(msg) {
+                    if let Err(e) = save_cursor(&cursor_file, &cursor) {
+                        warn!("Failed to save cursor: {}", e);
                     }
                 }
 
@@ -369,6 +392,49 @@ fn get_msg_log_level(msg: &str) -> Option<LevelMsg> {
     // first group match
     let level = RE.captures(msg)?.get(1)?.as_str().trim();
     Some(LevelMsg::from(level))
+}
+
+/// Generate cursor file path based on journal directory
+fn get_cursor_file_path(config: &Config) -> String {
+    if config.journal_dir.is_empty() {
+        "/tmp/jctl2gray_cursor".to_string()
+    } else {
+        format!("/tmp/jctl2gray_cursor_{}", 
+                config.journal_dir.replace('/', "_").replace("-", "_"))
+    }
+}
+
+/// Load cursor from file
+fn load_cursor(cursor_file: &str) -> Option<String> {
+    match fs::read_to_string(cursor_file) {
+        Ok(cursor) => {
+            let cursor = cursor.trim().to_string();
+            if cursor.is_empty() {
+                None
+            } else {
+                Some(cursor)
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+/// Save cursor to file
+fn save_cursor(cursor_file: &str, cursor: &str) -> Result<()> {
+    fs::write(cursor_file, cursor)
+        .map_err(|e| Error::InternalError(format!("Failed to write cursor file: {}", e)))
+}
+
+/// Extract __CURSOR field from JSON log entry
+fn extract_cursor_from_json(json_line: &str) -> Option<String> {
+    match serde_json::from_str::<HashMap<String, serde_json::Value>>(json_line) {
+        Ok(json) => {
+            json.get("__CURSOR")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        }
+        Err(_) => None,
+    }
 }
 
 /// Just bind a socket to any interface.
