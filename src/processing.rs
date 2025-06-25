@@ -118,6 +118,10 @@ pub fn process_journalctl(config: Config) -> Result<()> {
 
     debug!("start reading from journalctl");
 
+    // Message counting for diagnostics
+    let mut messages_received = 0u64;
+    let mut messages_processed = 0u64;
+
     // Main loop - process stdout messages and log stderr messages
     loop {
         // Check for stderr messages (non-blocking)
@@ -128,10 +132,12 @@ pub fn process_journalctl(config: Config) -> Result<()> {
         // Wait for stdout messages (blocking)
         match stdout_rx.recv() {
             Ok(line) => {
+                messages_received += 1;
                 let msg = line.trim();
 
                 // verify if stdout was closed (empty line could be valid JSON)
                 if msg.is_empty() {
+                    error!("Message dropped: Empty line received (message #{})", messages_received);
                     continue;
                 }
 
@@ -155,8 +161,19 @@ pub fn process_journalctl(config: Config) -> Result<()> {
                 }
 
                 process_log_record(msg, &config, &sender, &target_addr);
+                messages_processed += 1;
+                
+                // Log progress every 1000 messages
+                if messages_processed % 1000 == 0 {
+                    info!("Progress: Processed {}/{} messages ({:.1}% success rate)", 
+                          messages_processed, messages_received, 
+                          (messages_processed as f64 / messages_received as f64) * 100.0);
+                }
             }
             Err(_) => {
+                info!("Final stats: Processed {}/{} messages ({:.1}% success rate)", 
+                      messages_processed, messages_received,
+                      (messages_processed as f64 / messages_received as f64) * 100.0);
                 debug!("stdout channel closed, stopping main loop");
                 break;
             }
@@ -233,21 +250,41 @@ pub fn process_stdin(config: Config) -> Result<()> {
 fn process_log_record(data: &str, config: &Config, sender: &UdpSocket, target: &SocketAddr) {
     match transform_record(data, config) {
         Ok(compressed_gelf) => {
-            if let Some(chunked) = ChunkedMessage::new(ChunkSize::WAN, compressed_gelf) {
-                for chunk in chunked.iter() {
-                    if let Err(e) = sender.send_to(&chunk, &target) {
-                        error!("sender failure: {}", e);
+            match ChunkedMessage::new(ChunkSize::WAN, compressed_gelf.clone()) {
+                Some(chunked) => {
+                    let mut chunks_sent = 0;
+                    let mut send_errors = 0;
+                    for chunk in chunked.iter() {
+                        match sender.send_to(&chunk, &target) {
+                            Ok(_) => chunks_sent += 1,
+                            Err(e) => {
+                                error!("UDP send failure for chunk {}: {}", chunks_sent, e);
+                                send_errors += 1;
+                            }
+                        }
                     }
+                    if send_errors > 0 {
+                        error!("Message partially sent: {}/{} chunks failed", send_errors, chunks_sent + send_errors);
+                    }
+                }
+                None => {
+                    error!("CRITICAL: Message dropped - chunking failed. Size: {} bytes, Max chunks: 128", compressed_gelf.len());
                 }
             }
         }
 
-        // ignore
-        Err(Error::InsufficientLogLevel) => debug!("Insufficient Log Level"),
+        // Log all message drops at ERROR level for visibility
+        Err(Error::InsufficientLogLevel) => {
+            error!("Message dropped: Insufficient log level");
+        }
 
-        Err(Error::NoMessage) => debug!("no message field found"),
+        Err(Error::NoMessage) => {
+            error!("Message dropped: Missing MESSAGE field in JSON: {}", data);
+        }
 
-        Err(e) => warn!("parsing error: {}, message: {}", e, data),
+        Err(e) => {
+            error!("Message dropped: Parsing error: {}, message: {}", e, data);
+        }
     }
 }
 
