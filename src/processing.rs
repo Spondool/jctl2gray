@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process;
-use std::sync::mpsc;
 use std::thread;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use serde_json;
@@ -38,125 +37,42 @@ pub fn process_journalctl(config: Config) -> Result<()> {
         ));
     }
 
-    let mut process_args = Vec::new();
-    let slice = &["-o", "json", "-f", "--merge"];
-    process_args.extend_from_slice(slice);
-
-    if config.journal_dir.len() > 0 {
-        process_args.push("--directory");
-        process_args.push(&config.journal_dir);
-    }
-
-    // Load cursor from file to resume from last position
-    let cursor_file = get_cursor_file_path(&config);
-    let cursor_option = load_cursor(&cursor_file);
-    
-    if let Some(ref cursor) = cursor_option {
-        info!("Resuming from cursor: {}", cursor);
-        process_args.push("--after-cursor");
-        process_args.push(cursor);
-    } else {
-        info!("No cursor found, starting from current position");
-        // Start from now to avoid historical messages
-        process_args.push("--since");
-        process_args.push("now");
-    }
-
-    let mut subprocess = process::Command::new("journalctl")
-        .args(&process_args)
-        .stdout(process::Stdio::piped())
-        .stderr(process::Stdio::piped())
-        .spawn()?;
-
-    // Take ownership of stdout and stderr for threading
-    let subprocess_stdout = subprocess.stdout.take().unwrap();
-    let subprocess_stderr = subprocess.stderr.take().unwrap();
-
-    // Create channels for communication between threads
-    let (stdout_tx, stdout_rx) = mpsc::channel::<String>();
-    let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
-
-    // Thread for handling stdout
-    let stdout_handle = thread::spawn(move || {
-        let mut reader = BufReader::new(subprocess_stdout);
-        let mut line = String::new();
-        loop {
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    debug!("journalctl stdout closed");
-                    break; // EOF
-                }
-                Ok(_) => {
-                    if stdout_tx.send(line.clone()).is_err() {
-                        debug!("stdout receiver dropped, stopping stdout thread");
-                        break;
-                    }
-                    line.clear();
-                }
-                Err(e) => {
-                    error!("error reading journalctl stdout: {}", e);
-                    break;
-                }
-            }
-        }
-    });
-
-    // Thread for handling stderr
-    let stderr_handle = thread::spawn(move || {
-        let mut reader = BufReader::new(subprocess_stderr);
-        let mut line = String::new();
-        loop {
-            match reader.read_line(&mut line) {
-                Ok(0) => {
-                    debug!("journalctl stderr closed");
-                    break; // EOF
-                }
-                Ok(_) => {
-                    if stderr_tx.send(line.clone()).is_err() {
-                        debug!("stderr receiver dropped, stopping stderr thread");
-                        break;
-                    }
-                    line.clear();
-                }
-                Err(e) => {
-                    error!("error reading journalctl stderr: {}", e);
-                    break;
-                }
-            }
-        }
-    });
-
     // bind to socket
     let sender = create_sender_udp(config.sender_port)?;
 
     // obtain target address (first resolve may fail)
     let (mut target_addr, mut target_addr_updated_at) = get_target_addr(&config.graylog_addr)?;
 
-    debug!("start reading from journalctl");
+    // Load cursor/timestamp from file to resume from last position
+    let cursor_file = get_cursor_file_path(&config);
+    let mut last_timestamp = load_last_timestamp(&cursor_file);
+    
+    if last_timestamp.is_none() {
+        // First run - start from current time to avoid historical messages
+        last_timestamp = Some(get_current_timestamp());
+        info!("First run, starting from current time");
+    } else {
+        info!("Resuming from timestamp: {}", last_timestamp.unwrap());
+    }
+
+    info!("Starting polling-based journalctl monitoring");
 
     // Message counting for diagnostics
-    let mut messages_received = 0u64;
-    let mut messages_processed = 0u64;
+    let mut total_messages_processed = 0u64;
+    let mut poll_count = 0u64;
 
-    // Main loop - process stdout messages and log stderr messages
+    // Main polling loop
     loop {
-        // Check for stderr messages (non-blocking)
-        while let Ok(stderr_line) = stderr_rx.try_recv() {
-            warn!("journalctl stderr: {}", stderr_line.trim());
-        }
-
-        // Wait for stdout messages (blocking)
-        match stdout_rx.recv() {
-            Ok(line) => {
-                messages_received += 1;
-                let msg = line.trim();
-
-                // verify if stdout was closed (empty line could be valid JSON)
-                if msg.is_empty() {
-                    error!("Message dropped: Empty line received (message #{})", messages_received);
-                    continue;
-                }
-
+        poll_count += 1;
+        let current_timestamp = get_current_timestamp();
+        
+        // Query for messages since last timestamp
+        let messages = query_journalctl_range(&config, last_timestamp.unwrap(), current_timestamp)?;
+        
+        if !messages.is_empty() {
+            info!("Poll #{}: Found {} new messages", poll_count, messages.len());
+            
+            for msg in messages {
                 // renew outdated target address
                 if target_addr_updated_at
                     .elapsed()
@@ -170,62 +86,32 @@ pub fn process_journalctl(config: Config) -> Result<()> {
                             target_addr_updated_at = updated_at;
                             debug!("target address updated");
                         }
-
-                        // use outdated address
                         Err(e) => warn!("cannot resolve graylog address: {}", e),
                     }
                 }
 
-                // Extract and save cursor before processing
-                if let Some(cursor) = extract_cursor_from_json(msg) {
-                    if let Err(e) = save_cursor(&cursor_file, &cursor) {
-                        warn!("Failed to save cursor: {}", e);
-                    }
-                }
-
-                process_log_record(msg, &config, &sender, &target_addr);
-                messages_processed += 1;
-                
-                // Log progress every 1000 messages
-                if messages_processed % 1000 == 0 {
-                    info!("Progress: Processed {}/{} messages ({:.1}% success rate)", 
-                          messages_processed, messages_received, 
-                          (messages_processed as f64 / messages_received as f64) * 100.0);
-                }
+                process_log_record(&msg, &config, &sender, &target_addr);
+                total_messages_processed += 1;
             }
-            Err(_) => {
-                info!("Final stats: Processed {}/{} messages ({:.1}% success rate)", 
-                      messages_processed, messages_received,
-                      (messages_processed as f64 / messages_received as f64) * 100.0);
-                debug!("stdout channel closed, stopping main loop");
-                break;
+            
+            // Update last timestamp to current time and save it
+            last_timestamp = Some(current_timestamp);
+            if let Err(e) = save_last_timestamp(&cursor_file, current_timestamp) {
+                warn!("Failed to save timestamp: {}", e);
             }
+            
+            // Log progress every 1000 messages
+            if total_messages_processed % 1000 == 0 {
+                info!("Total processed: {} messages across {} polls", 
+                      total_messages_processed, poll_count);
+            }
+        } else {
+            debug!("Poll #{}: No new messages", poll_count);
         }
+        
+        // Sleep for 1 second before next poll
+        thread::sleep(Duration::from_secs(1));
     }
-
-    // Wait for threads to finish
-    let _ = stdout_handle.join();
-    let _ = stderr_handle.join();
-
-    // Check subprocess exit status
-    match subprocess.wait() {
-        Ok(status) => {
-            if !status.success() {
-                return Err(Error::InternalError(format!(
-                    "journalctl process exited with status: {}",
-                    status
-                )));
-            }
-        }
-        Err(e) => {
-            return Err(Error::InternalError(format!(
-                "failed to wait for journalctl process: {}",
-                e
-            )));
-        }
-    }
-
-    Ok(())
 }
 
 pub fn process_stdin(config: Config) -> Result<()> {
@@ -404,37 +290,77 @@ fn get_cursor_file_path(config: &Config) -> String {
     }
 }
 
-/// Load cursor from file
-fn load_cursor(cursor_file: &str) -> Option<String> {
+/// Get current timestamp in seconds since epoch
+fn get_current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Format timestamp for journalctl --since/--until
+fn format_timestamp(timestamp: u64) -> String {
+    // journalctl accepts "@timestamp" format for epoch seconds
+    format!("@{}", timestamp)
+}
+
+/// Load last timestamp from file
+fn load_last_timestamp(cursor_file: &str) -> Option<u64> {
     match fs::read_to_string(cursor_file) {
-        Ok(cursor) => {
-            let cursor = cursor.trim().to_string();
-            if cursor.is_empty() {
-                None
-            } else {
-                Some(cursor)
-            }
+        Ok(content) => {
+            content.trim().parse::<u64>().ok()
         }
         Err(_) => None,
     }
 }
 
-/// Save cursor to file
-fn save_cursor(cursor_file: &str, cursor: &str) -> Result<()> {
-    fs::write(cursor_file, cursor)
-        .map_err(|e| Error::InternalError(format!("Failed to write cursor file: {}", e)))
+/// Save last timestamp to file
+fn save_last_timestamp(cursor_file: &str, timestamp: u64) -> Result<()> {
+    fs::write(cursor_file, timestamp.to_string())
+        .map_err(|e| Error::InternalError(format!("Failed to write timestamp file: {}", e)))
 }
 
-/// Extract __CURSOR field from JSON log entry
-fn extract_cursor_from_json(json_line: &str) -> Option<String> {
-    match serde_json::from_str::<HashMap<String, serde_json::Value>>(json_line) {
-        Ok(json) => {
-            json.get("__CURSOR")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        }
-        Err(_) => None,
+/// Query journalctl for messages in a specific time range
+fn query_journalctl_range(config: &Config, since: u64, until: u64) -> Result<Vec<String>> {
+    let mut process_args = Vec::new();
+    let slice = &["-o", "json", "--merge"];
+    process_args.extend_from_slice(slice);
+
+    if config.journal_dir.len() > 0 {
+        process_args.push("--directory");
+        process_args.push(&config.journal_dir);
     }
+
+    // Add time range
+    let since_str = format_timestamp(since);
+    let until_str = format_timestamp(until);
+    process_args.push("--since");
+    process_args.push(&since_str);
+    process_args.push("--until");  
+    process_args.push(&until_str);
+
+    debug!("Querying journalctl: {:?}", process_args);
+
+    let output = process::Command::new("journalctl")
+        .args(&process_args)
+        .output()
+        .map_err(|e| Error::InternalError(format!("Failed to execute journalctl: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::InternalError(format!(
+            "journalctl query failed: {}", stderr
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let messages: Vec<String> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.to_string())
+        .collect();
+
+    Ok(messages)
 }
 
 /// Just bind a socket to any interface.
