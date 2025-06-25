@@ -92,18 +92,18 @@ pub fn process_journalctl(config: Config) -> Result<()> {
 
                 process_log_record(&msg, &config, &sender, &target_addr);
                 total_messages_processed += 1;
+                
+                // Log progress every 1000 messages (check after each message)
+                if total_messages_processed % 1000 == 0 {
+                    info!("Total processed: {} messages across {} polls", 
+                          total_messages_processed, poll_count);
+                }
             }
             
             // Update last timestamp to current time and save it
             last_timestamp = Some(current_timestamp);
             if let Err(e) = save_last_timestamp(&cursor_file, current_timestamp) {
                 warn!("Failed to save timestamp: {}", e);
-            }
-            
-            // Log progress every 1000 messages
-            if total_messages_processed % 1000 == 0 {
-                info!("Total processed: {} messages across {} polls", 
-                      total_messages_processed, poll_count);
             }
         } else {
             debug!("Poll #{}: No new messages", poll_count);
