@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process;
+use std::sync::mpsc;
+use std::thread;
 use std::time::SystemTime;
 
 use regex::Regex;
@@ -50,11 +52,63 @@ pub fn process_journalctl(config: Config) -> Result<()> {
         .stderr(process::Stdio::piped())
         .spawn()?;
 
-    // Dirty trick. In theory it doesn't have to work, because an operating system
-    // is allowed to make the BufReader wait for more data in read, but in practice
-    // the operating systems prefer the early "short reads" to waiting.
-    let mut subprocess_stdout = BufReader::new(subprocess.stdout.as_mut().unwrap());
-    let mut subprocess_stderr = BufReader::new(subprocess.stderr.as_mut().unwrap());
+    // Take ownership of stdout and stderr for threading
+    let subprocess_stdout = subprocess.stdout.take().unwrap();
+    let subprocess_stderr = subprocess.stderr.take().unwrap();
+
+    // Create channels for communication between threads
+    let (stdout_tx, stdout_rx) = mpsc::channel::<String>();
+    let (stderr_tx, stderr_rx) = mpsc::channel::<String>();
+
+    // Thread for handling stdout
+    let stdout_handle = thread::spawn(move || {
+        let mut reader = BufReader::new(subprocess_stdout);
+        let mut line = String::new();
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    debug!("journalctl stdout closed");
+                    break; // EOF
+                }
+                Ok(_) => {
+                    if stdout_tx.send(line.clone()).is_err() {
+                        debug!("stdout receiver dropped, stopping stdout thread");
+                        break;
+                    }
+                    line.clear();
+                }
+                Err(e) => {
+                    error!("error reading journalctl stdout: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Thread for handling stderr
+    let stderr_handle = thread::spawn(move || {
+        let mut reader = BufReader::new(subprocess_stderr);
+        let mut line = String::new();
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    debug!("journalctl stderr closed");
+                    break; // EOF
+                }
+                Ok(_) => {
+                    if stderr_tx.send(line.clone()).is_err() {
+                        debug!("stderr receiver dropped, stopping stderr thread");
+                        break;
+                    }
+                    line.clear();
+                }
+                Err(e) => {
+                    error!("error reading journalctl stderr: {}", e);
+                    break;
+                }
+            }
+        }
+    });
 
     // bind to socket
     let sender = create_sender_udp(config.sender_port)?;
@@ -64,44 +118,74 @@ pub fn process_journalctl(config: Config) -> Result<()> {
 
     debug!("start reading from journalctl");
 
-    let mut buff = String::new();
+    // Main loop - process stdout messages and log stderr messages
     loop {
-        subprocess_stdout.read_line(&mut buff)?;
-
-        {
-            let msg = buff.trim();
-
-            // verify if stdout was closed
-            if msg.is_empty() {
-                let mut err_buff = String::new();
-                subprocess_stderr.read_line(&mut err_buff)?;
-                return Err(Error::InternalError(err_buff));
-            }
-
-            // renew outdated target address
-            if target_addr_updated_at
-                .elapsed()
-                .unwrap_or_default()
-                .as_secs()
-                > config.graylog_addr_ttl
-            {
-                match get_target_addr(&config.graylog_addr) {
-                    Ok((addr, updated_at)) => {
-                        target_addr = addr;
-                        target_addr_updated_at = updated_at;
-                        debug!("target address updated");
-                    }
-
-                    // use outdated address
-                    Err(e) => warn!("cannot resolve graylog address: {}", e),
-                }
-            }
-
-            process_log_record(msg, &config, &sender, &target_addr);
+        // Check for stderr messages (non-blocking)
+        while let Ok(stderr_line) = stderr_rx.try_recv() {
+            warn!("journalctl stderr: {}", stderr_line.trim());
         }
 
-        buff.clear();
+        // Wait for stdout messages (blocking)
+        match stdout_rx.recv() {
+            Ok(line) => {
+                let msg = line.trim();
+
+                // verify if stdout was closed (empty line could be valid JSON)
+                if msg.is_empty() {
+                    continue;
+                }
+
+                // renew outdated target address
+                if target_addr_updated_at
+                    .elapsed()
+                    .unwrap_or_default()
+                    .as_secs()
+                    > config.graylog_addr_ttl
+                {
+                    match get_target_addr(&config.graylog_addr) {
+                        Ok((addr, updated_at)) => {
+                            target_addr = addr;
+                            target_addr_updated_at = updated_at;
+                            debug!("target address updated");
+                        }
+
+                        // use outdated address
+                        Err(e) => warn!("cannot resolve graylog address: {}", e),
+                    }
+                }
+
+                process_log_record(msg, &config, &sender, &target_addr);
+            }
+            Err(_) => {
+                debug!("stdout channel closed, stopping main loop");
+                break;
+            }
+        }
     }
+
+    // Wait for threads to finish
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+
+    // Check subprocess exit status
+    match subprocess.wait() {
+        Ok(status) => {
+            if !status.success() {
+                return Err(Error::InternalError(format!(
+                    "journalctl process exited with status: {}",
+                    status
+                )));
+            }
+        }
+        Err(e) => {
+            return Err(Error::InternalError(format!(
+                "failed to wait for journalctl process: {}",
+                e
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn process_stdin(config: Config) -> Result<()> {
