@@ -159,7 +159,7 @@ fn process_log_record(data: &str, config: &Config, sender: &UdpSocket, target: &
         }
 
         // ignore
-        Err(Error::InsufficientLogLevel) => {}
+        Err(Error::InsufficientLogLevel) => debug!("Insufficient Log Level"),
 
         Err(Error::NoMessage) => debug!("no message field found"),
 
